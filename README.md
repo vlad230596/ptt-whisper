@@ -1,5 +1,7 @@
 # ptt-whisper
 
+[![tests](https://github.com/vlad230596/ptt-whisper/actions/workflows/tests.yml/badge.svg)](https://github.com/vlad230596/ptt-whisper/actions/workflows/tests.yml)
+
 > [!NOTE]
 > **Written by Claude, for one person's machine and habits.** This is a personal tool
 > published as-is: it was built and tuned against one GPU, one microphone, one language
@@ -17,6 +19,63 @@ with the network unplugged.
 Tuned for Russian dictation with English technical terms kept in latin script and correct
 case (`RemoteTracking` stays `RemoteTracking`, not «ремоут трекинг»), but the language and
 the vocabulary are one line each in `config.py`.
+
+## Install
+
+**Windows 10/11, an NVIDIA GPU** with ~4 GB free VRAM, and ~4 GB of disk for the model.
+Nothing else is needed up front: no CUDA toolkit (cuBLAS and cuDNN are pip packages), no
+ffmpeg (PyAV bundles it), no Python and **no uv — the bootstrap installs it**. Get the code
+either way — [the latest release zip](../../releases/latest), or `git clone` — and put it in
+a path **without spaces and outside OneDrive**; both are checked and refused rather than
+assumed.
+
+> [!IMPORTANT]
+> **Do not install the pieces by hand.** One step does all of it — uv, Python 3.13, the
+> dependencies, the 2.9 GB model, the tray icons, the PATH entry, autostart, and an
+> end-to-end check that actually loads the model and decodes on the GPU. Either
+> double-click **`Install.cmd`**, or run the same thing yourself:
+>
+> ```powershell
+> powershell -ExecutionPolicy Bypass -File deploy\Setup.ps1 -- --add-to-path --autostart --start
+> ```
+>
+> It is idempotent — safe to re-run, and re-running it is also the repair command. Budget
+> 15–25 minutes, almost all of it the model download.
+
+Two things the installer cannot do for you, in the order you will hit them:
+
+1. **`ptt` does not work in the shell you ran setup from.** The PATH entry it adds reaches
+   *new* processes only; your current PowerShell keeps the environment it started with.
+   Either open a new terminal, or use the local wrapper — PowerShell does not run commands
+   from the current directory without it:
+
+   ```powershell
+   .\ptt start          # in the shell you just installed from
+   ptt start            # in any shell opened afterwards
+   ```
+
+2. **The microphone default belongs to someone else's machine.** `MIC` in `config.py` is
+   the developer's device name, so on your machine setup ends with a `[FAIL]` on the
+   microphone check and a list of what it found instead. That is expected on a first run,
+   and it is one command to fix:
+
+   ```powershell
+   .\ptt mic            # pick from a list, with a live level meter
+   ```
+
+   The choice is written to `settings.json` and takes effect immediately — no restart, and
+   nothing to edit in Python.
+
+Then hold **F8**, say something, release. If nothing happens, `ptt doctor` prints what it
+found at every step rather than a verdict.
+
+> [!TIP]
+> **Turn on Windows clipboard history** — Settings → System → Clipboard, or press
+> **Win+V** and click "Turn on". Every dictation takes the clipboard and does *not* put
+> the previous contents back (see [What happens on a dictation](#what-happens-on-a-dictation)
+> for why restoring it is unsafe). With history on, whatever you had copied is still one
+> **Win+V** away — and so is every dictation you have made since, which doubles as a
+> recovery path if a paste lands in the wrong place.
 
 ## What it solves
 
@@ -70,8 +129,15 @@ CTranslate2 has no sm_120 IMMA kernels, so `int8` fails outright.
   alongside the cleaned one whenever the filter actually changed something.
 - **Adaptive batching** — parallel decoding above 15 s of audio, sequential below, because
   batching a single VAD chunk is slower.
-- **Media auto-pause**: whatever is playing is paused over SMTC while you speak and
-  resumed when you stop.
+- **The music stops while you talk, by itself.** Anything currently playing through a
+  Windows media session — Yandex Music, Spotify, a video in the browser, the Media Player
+  app — is paused the moment you press the key and resumed when you release it, so you do
+  not dictate over your own soundtrack or into a microphone that can hear it. It goes
+  through SMTC, the channel the hardware media keys use, so it reaches the actual player
+  instead of broadcasting a blind play/pause keystroke, and it *pauses* rather than muting
+  — nothing plays on unheard. On by default (`PAUSE_MEDIA`); `PAUSE_MEDIA_APPS` narrows it
+  to chosen players, and **Ctrl+Alt+F8** dumps the live session list with the ids to put
+  in it.
 - **A microphone chooser with a live level meter** (Ctrl+Alt+M), one entry per physical
   jack rather than one per host API, saying which devices are silent, clipping, or refuse
   to open at all. The choice takes effect without a restart.
@@ -83,20 +149,6 @@ CTranslate2 has no sm_120 IMMA kernels, so `int8` fails outright.
   extending the vocabulary from your own misses.
 - **150 tests**, including ones that build a real window and inject real keystrokes into
   it, so focus handling and Ctrl+V are covered rather than assumed.
-
-## Requirements
-
-Windows 10/11, an NVIDIA GPU with ~4 GB free VRAM, [uv](https://docs.astral.sh/uv/), and
-about 4 GB of disk for the model. No CUDA toolkit — the libraries come from pip. Install
-into a path without spaces and outside OneDrive.
-
-> [!TIP]
-> **Turn on Windows clipboard history** — Settings → System → Clipboard, or press
-> **Win+V** and click "Turn on". Every dictation takes the clipboard and does *not* put
-> the previous contents back (see [What happens on a dictation](#what-happens-on-a-dictation)
-> for why restoring it is unsafe). With history on, whatever you had copied is still one
-> **Win+V** away — and so is every dictation you have made since, which doubles as a
-> recovery path if a paste lands in the wrong place.
 
 ## Running it
 
@@ -116,17 +168,14 @@ ptt run                      # foreground, logs on the console
 ```
 
 `StartPushToTalk.cmd` and `Dev.cmd` still work and do the same as `ptt start` / `ptt run`.
+In a shell opened before the install, all of these need the `.\` prefix — see
+[Install](#install).
 
-On a machine that has never run it, copy the project files and run this instead:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File deploy\Setup.ps1 -- --add-to-path --autostart --start
-```
-
-The script does only what cannot be done from inside the app — install uv and run
-`uv sync` — and then hands over to `ptt setup`, which fetches the model, generates the
-icons, wires up the PATH and autostart, and checks the whole thing end to end. Both halves
-are idempotent, so `ptt setup` is equally the repair command.
+On a machine that has never run it, start from [Install](#install) instead: the bootstrap
+script does only what cannot be done from inside the app — install uv and run `uv sync` —
+and then hands over to `ptt setup`, which fetches the model, generates the icons, wires up
+the PATH and autostart, and checks the whole thing end to end. Both halves are idempotent,
+so `ptt setup` is equally the repair command.
 
 ```
 ptt setup                    # re-run the install; changes nothing outside the project
@@ -225,6 +274,45 @@ and pastes the previous contents instead of what you just said. Reproduced at a 
 stall, and fixed by the timer at 5 s — so the cause was the timer, not the write, which is
 synchronous and immediately readable even on a saturated CPU. A longer timer would only
 narrow the window, and it would still overwrite anything you copied in the meantime.
+
+## Known limitations
+
+**Sometimes a whole dictation comes back with no punctuation and no capitals.** Every now
+and then — not reproducibly, and seemingly unrelated to what was said or how long it was —
+an utterance arrives as one run-on line: no sentence breaks, no commas or full stops, every
+word lower-cased, including the first one and the terms from `HOTWORDS` that are otherwise
+capitalised correctly. Saying the same thing again normally comes back formatted properly.
+
+This is almost certainly the engine rather than anything downstream: Whisper decides
+punctuation and casing during decoding, `text.py` only drops whole segments and never
+rewrites either, and the archived `.mp3` for such an utterance plays back perfectly clean.
+Suspected cause, unproven: a decode where the initial prompt stops steering the output —
+Whisper is known to produce unpunctuated lower-case text when its context does not
+establish a written style, and a temperature fallback after a failed decode is the usual
+trigger. Not fixed, and not currently worked around. The material for diagnosing it is
+already on disk: when it happens, keep the `dataset/ptt_<stamp>.mp3` + `.txt` pair — the
+audio decoded a second time is the experiment.
+
+**`F8` is swallowed globally.** VS Code's "Go to Next Problem" and every debugger's
+step-over stop working while this runs. Change `HOTKEY_REC`; see the note above about it
+being a poor default.
+
+**Elevated windows need the elevated autostart.** An ordinary process cannot install a
+hook that sees input destined for a higher-integrity window.
+
+**The microphone is a substring match against a device name**, so it is machine-specific,
+and an HD Audio input endpoint *disappears* from the list entirely when nothing is plugged
+into the jack — which presents as "matches nothing" rather than as silence. That is
+deliberately an error at the next dictation instead of a silent fallback to some other
+device. Ctrl+Alt+M is the fix. Two microphones whose names are a prefix of one another
+would fold into one entry in the chooser.
+
+**Not every device can be metered.** A Bluetooth headset here fails to open under WDM-KS
+with COM initialised and everything else right; the chooser says so in the window rather
+than pretending the device is silent.
+
+**Short acronyms in fast speech stay unreliable.** Extend `HOTWORDS` from your own misses
+in `dataset/`.
 
 ## Tests
 

@@ -1,7 +1,8 @@
 # Improvement list
 
-Ideas worth doing, with enough notes to start without re-deriving the problem. Newest
-first; nothing here is in progress.
+Ideas worth doing, with enough notes to start without re-deriving the problem. Nothing
+here is in progress. The numbers are for cross-referencing between items, not priority —
+items refer to each other by number, so they are never renumbered.
 
 ---
 
@@ -196,3 +197,123 @@ both the status display and the control surface:
   zero-dependency property but is a lot of hand-written layout for something this
   interactive. This is the point at which a real toolkit (Qt, or a webview) earns its
   place. Deliberately not decided here.
+
+---
+
+## 6. Corrections in the archive, and regression tests built on them
+
+**What:** every utterance is already kept as `dataset\ptt_<stamp>.mp3` + `.txt` (plus
+`.raw.txt` when the hallucination filter changed something). What is missing is a
+*verdict*: was that transcription actually right? Add one more file next to the pair —
+`<stamp>.fixed.txt`, the text as it should have been — and its presence becomes the label:
+
+| Files present | Means |
+| --- | --- |
+| `.mp3` + `.txt` | not reviewed |
+| ...plus `.fixed.txt` identical to `.txt` | confirmed correct |
+| ...plus `.fixed.txt` differing | a recorded failure, with the ground truth attached |
+
+**Why the good ones matter as much as the bad ones.** A pile of failures tells you what is
+broken; it cannot tell you whether a fix broke something else. Every change this project is
+likely to make next — a term added to `HOTWORDS`, a different `initial_prompt`, a VAD
+threshold, `condition_on_previous_text`, another model — is global and affects every
+utterance. Without a corpus of *confirmed-correct* transcriptions to decode again, such
+changes are evaluated the way they are today: on the next thing said out loud, once. That
+is how a term list quietly starts eating something that used to work.
+
+**Entering the correction.** The natural home is the history view in item 5, but it must
+not wait for it — a correction only ever gets made in the ten seconds after the wrong
+paste, not in a review session later:
+
+```
+ptt fix           # open the last dictation's .txt in the editor; saving writes .fixed.txt
+ptt fix <stamp>   # a specific one
+ptt fix --ok      # mark the last one correct as it stands (copies .txt to .fixed.txt)
+```
+
+`--ok` is the one that would be used dozens of times a day, and it is what makes the
+confirmed-correct corpus grow at all, so it should end up on a hotkey rather than in a
+console. Resist any bulk "mark everything unreviewed as correct": an unreviewed pile
+labelled correct is worse than an unlabelled one, because it looks like evidence.
+
+**The regression run.** For every pair that has a `.fixed.txt`, decode the `.mp3` with the
+current settings and compare against the correction:
+
+- Report **character error rate**, not equality. An exact match on 500 characters of
+  Russian is not a realistic bar, and a CER threshold is what separates "worded slightly
+  differently" from "regressed".
+- Report **two** numbers: CER as-is, and CER after stripping case and punctuation. The gap
+  between them isolates formatting errors from recognition errors — which is exactly the
+  shape of the unpunctuated-lower-case bug in README's known limitations, and would turn it
+  from an anecdote into something with a number attached.
+- Per-file output, not only an aggregate. A change that fixes three utterances and breaks
+  one is the normal case, and a mean hides it.
+- Mark it `dataset` (or `slow`) and keep it out of the default run: it loads the model and
+  decodes N files, whereas the point of `uv run pytest` finishing in 11 seconds is that it
+  gets run constantly. `uv run pytest -m dataset` is then a deliberate act before and after
+  a change.
+
+**Design notes:**
+
+- `dataset/` is gitignored and always will be — it is the owner's voice — so this suite can
+  never run in CI. It is a local quality gate, and must skip cleanly when the directory is
+  absent, exactly as [`tests/test_text.py`](tests/test_text.py) already does for its two
+  dataset-driven cases. Those two are the precedent for this whole item and should end up
+  sharing its loader.
+- Normalise whitespace the way the paste does (one line, stripped) before comparing, but do
+  **not** normalise case or punctuation away — see the two-number point above.
+- Storage is not a constraint: mp3 costs ~3.2 KB per second of audio, so a year of heavy
+  daily use is a few hundred megabytes.
+- The same corrected corpus is what fine-tuning would need later (item 5's ambition), but
+  the regression suite is the part that pays for itself immediately, and it pays using
+  recordings that already exist.
+
+---
+
+## 7. A release you can run without installing anything
+
+**Where it stands:** `.github/workflows/release.yml` publishes a source zip on every `v*`
+tag, and `Install.cmd` makes it a double-click. That removes git, Python and uv from the
+prerequisites, but the machine still downloads ~5 GB on first run and still needs the
+install to succeed. A true "download one file and it works" build is a different thing, and
+the numbers are why it has not been done.
+
+**The size problem, measured on this machine** (`.venv\Lib\site-packages`, 2,239 MB total):
+
+| Part | Size |
+| --- | --- |
+| `nvidia\cudnn` | 1,071 MB |
+| `nvidia\cublas` | 736 MB |
+| `nvidia\cuda_nvrtc` | 178 MB |
+| `ctranslate2`, `onnxruntime`, `numpy`, the rest | ~250 MB |
+| the model, separately in `models\` | 2,880 MB |
+
+A bundle that runs offline is therefore ~5.1 GB uncompressed. **GitHub caps a release asset
+at 2 GB**, so that artifact cannot be published as one file at all — and the model half is
+already a public download from Hugging Face, which is why `ptt setup` fetches it rather than
+this project redistributing someone else's weights.
+
+**Which leaves one honest option to evaluate:** a PyInstaller (or `uv`-based) bundle with
+the code, CPython and the CUDA DLLs but *without* the model, published as an asset, with the
+model still fetched on first run. Raw that is ~2.2 GB; zip compresses DLLs well, so it
+plausibly lands near 1.1–1.4 GB — under the cap, but not by much, and unverified. Pruning is
+the real lever: `cudnn` ships precompiled engines for every architecture, and this project
+targets exactly one GPU generation at a time.
+
+**What makes it real work rather than a build flag:**
+
+- Hidden imports and data files for `ctranslate2`, `av`, `dearpygui` (its built-in font),
+  `onnxruntime` (the Silero VAD model) and the `winrt` extension modules — each is a
+  separate discovery, and each failure appears only at run time, on someone else's machine.
+- `cudalibs.preload()` resolves the CUDA DLLs by absolute path *inside site-packages*
+  (see CLAUDE.md for why the bare `LoadLibrary` cannot find them). A frozen layout moves
+  those files, so that path logic has to learn about `sys._MEIPASS`, and getting it wrong
+  reproduces exactly the bug that function exists to prevent.
+- Antivirus and SmartScreen treat an unsigned one-file exe that installs a global keyboard
+  hook roughly as you would expect. Code signing is a real cost with a real certificate.
+- The end result would still not be testable in CI: no GPU on a runner means the bundle can
+  be built there but never proven to decode.
+
+**So the sequencing is:** keep the source zip as the supported path; do the bundle only if
+someone other than the owner actually needs it, and start by measuring a pruned `cudnn`,
+because if that does not get comfortably under the cap the rest is wasted effort.

@@ -83,10 +83,17 @@ packages listed in `pyproject.toml`), **no ffmpeg** (PyAV bundles it), **no Pyth
    name:
 
    ```powershell
-   ptt mic              # pick one from a list, with a level meter to prove it hears you
-   ptt devices          # what this machine has, and what the choice resolves to
-   ptt doctor           # re-run every check
+   .\ptt mic            # pick one from a list, with a level meter to prove it hears you
+   .\ptt devices        # what this machine has, and what the choice resolves to
+   .\ptt doctor         # re-run every check
    ```
+
+   **The `.\` is not a typo, and it is only needed here.** `--add-to-path` writes the user
+   PATH in the registry, which is read by processes when they *start*: the shell you ran
+   setup from keeps the environment it was born with, so plain `ptt` there fails with
+   `The term 'ptt' is not recognized`, and PowerShell does not fall back to the current
+   directory either. Open a new terminal and `ptt <command>` works everywhere; stay in this
+   one and prefix it. Setup's closing hints spell out whichever applies.
 
    `ptt mic` writes `settings.json`, which overrides `MIC` and takes effect at the next
    dictation — no restart. Editing `MIC` in `config.py` still works and is what a machine
@@ -129,6 +136,7 @@ it found at each step rather than a verdict. The cases it distinguishes:
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
+| `The term 'ptt' is not recognized` | the PATH entry reaches only processes started after setup, and PowerShell never runs a command from the current directory | `.\ptt <command>` here, or open a new terminal |
 | `microphone ... matches none of these` | device name differs, or the jack is unplugged — an HD Audio input endpoint disappears entirely when nothing is in the socket | `ptt mic` and pick one; the report says whether the name came from `settings.json` or `config.py` |
 | `CUBLAS_STATUS_NOT_SUPPORTED` on the first decode | wrong compute type for the GPU | `COMPUTE_TYPE` must stay `float16`; int8 selects IMMA kernels that do not exist for sm_120 |
 | `Library cublas64_12.dll is not found` | the pip CUDA packages did not install | `uv sync` again; see `pushtotalk\cudalibs.py` for why the DLLs are loaded by absolute path |

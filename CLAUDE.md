@@ -159,6 +159,26 @@ machine needs and the one thing a copied `config.py` always gets wrong, so setup
 and reports it — but writing it back belongs to the settings work in flight, not to a
 second mechanism invented in the installer.
 
+Setup's closing hints prefix the commands with `.\` whenever the project directory is
+missing from the *running process's* `PATH` — asked of `os.environ` through `path_with`, not
+of the registry, because a PATH entry is read by a process when it starts and the shell
+reading the hints started before it was written. It cost the owner a "command not found" on
+the second machine, followed by PowerShell's own refusal to run `ptt` from the current
+directory. The same summary also deduplicates its problem list: the GPU is checked in step 1
+and again by `doctor` in step 6, so the driver warning arrived twice and the count disagreed
+with the list beneath it.
+
+### CI runs the tests; a release is the source, not a bundle
+GitHub Actions has no GPU, no microphone and no interactive desktop, so `tests.yml` can only
+run `-m "not integration"` — which is exactly the split the suite already has, because the
+device list is faked through monkeypatch and only the focus-stealing tests are marked. Do
+not try to make the GPU path run there; `ptt doctor` on a real machine is that test.
+
+`release.yml` publishes a `git archive` of the tag plus `Install.cmd`. It is deliberately
+not a frozen application: the CUDA libraries are 1,985 MB of the 2,239 MB venv and the model
+is another 2,880 MB, against GitHub's 2 GB per-asset limit — item 7 in `BACKLOG.md` has the
+measurements and what a real bundle would take.
+
 ### `settings.json` is the only setting outside `config.py`, and only because of the chooser
 Picking a microphone from a list and then having to edit Python to make it stick is not a
 setting flow, and a program that rewrites its own source is worse than one with two
@@ -256,6 +276,22 @@ on live speech.
 
 ## Known limitations
 
+- **Unpunctuated, all-lower-case output on an occasional utterance.** Reported by the owner
+  on 2026-08-13, from ordinary use: now and then a whole dictation arrives as one run-on
+  line — no sentence breaks, no punctuation, every word lower-cased including `HOTWORDS`
+  terms that are normally cased correctly. Repeating the same sentence gives correct output.
+  **Not reproduced under test, so nothing below is measured — do not write it up as if it
+  were.** What is known: `text.py` cannot cause it (it drops whole segments, and never
+  touches case or punctuation), and the archived mp3 is clean, which rules out capture.
+  That leaves decoding. The likely mechanism is a decode in which the initial prompt stops
+  steering the written style — a temperature fallback after a failed decode is the usual
+  trigger in Whisper, and `initial_prompt` is exactly what teaches casing here (see the
+  decision above). **The experiment is cheap and has not been run**: take the `.mp3` of an
+  affected utterance from `dataset/`, decode it repeatedly, and see whether the bad output
+  is reproducible from that audio (a decoding-path bug) or appears only sometimes (a
+  sampling one). Only then is it worth touching `temperature`, `condition_on_previous_text`
+  or the prompt. Because the pair is archived automatically, the evidence for the next
+  occurrence already exists — ask for the stamp rather than asking the owner to reproduce.
 - **`F8` is swallowed globally**, so VS Code's "Go to Next Problem" and debugger F8 stop
   working while it runs. Change `HOTKEY_REC` if that matters.
 - **Elevated windows** need the elevated logon task; an ordinary process cannot hook them.

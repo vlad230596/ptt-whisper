@@ -16,6 +16,7 @@ in flight, not to a second mechanism invented here.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -133,12 +134,20 @@ def _step_icons(root: Path) -> None:
               f"stock Windows icon")
 
 
-def _step_path(root: Path, add: bool) -> None:
+def _step_path(root: Path, add: bool) -> bool:
+    """Do the step; return True if `ptt` will not resolve in *this* shell.
+
+    Which is the question the closing hints need answered, and the registry cannot answer
+    it: a PATH entry is read by a process when it starts, so writing one now says nothing
+    about the shell already running. `os.environ` does say — and `path_with` returning None
+    for "already there" is exactly the test, reused rather than restated.
+    """
     _title("4. Making `ptt` available from any prompt")
     if add:
         _add_to_path(root)
     else:
         _info(f"not added; re-run with --add-to-path, or call {root}\\ptt.cmd by path")
+    return path_with(str(root), os.environ.get("PATH", "")) is not None
 
 
 def _step_autostart(enable: bool, elevated: bool) -> None:
@@ -182,32 +191,53 @@ def main(
         print("\nStopping: without the model there is nothing to check.")
         return 1
     _step_icons(root)
-    _step_path(root, add_to_path)
+    needs_prefix = _step_path(root, add_to_path)
     _step_autostart(autostart, elevated)
     report = _step_checks(root)
 
     print("=" * 74)
-    problems = report.failures + machine.warnings + report.warnings
+    # The GPU and driver are checked twice -- once in step 1, once by `doctor` in step 6 --
+    # so the same warning arrives from both and would be listed, and counted, twice.
+    warnings = list(dict.fromkeys(machine.warnings + report.warnings))
     if report.failures:
         print(f"  Setup finished; {len(report.failures)} thing(s) still need attention:")
-    elif problems:
-        print(f"  Ready, with {len(problems)} thing(s) worth a look:")
+        for problem in report.failures:
+            print(f"    - {problem.splitlines()[0]}")
+        if warnings:
+            print(f"  ...and {len(warnings)} worth a look, but nothing that stops it:")
+    elif warnings:
+        print(f"  Ready, with {len(warnings)} thing(s) worth a look:")
     else:
         print(f"  Ready. Hold {cfg.HOTKEY_REC} and speak.")
-    for problem in problems:
-        print(f"    - {problem.splitlines()[0]}")
+    for warning in warnings:
+        print(f"    - {warning.splitlines()[0]}")
 
     if start and not report.failures:
         ok, message = service.start()
         print(f"\n  {message}")
 
-    print("\n  Next:")
-    for command, what in (
-        ("ptt devices", "list microphones; MIC in config.py must match one"),
-        ("ptt doctor", "re-run these checks"),
-        ("ptt start", "run it in the background"),
+    # `ptt` resolves through the PATH entry, which reaches new processes only -- so in the
+    # shell setup was just run from, the one place these hints are read, the bare name is
+    # exactly what does not work. PowerShell will not run `ptt` from the current directory
+    # either, so the fallback has to be spelled `.\ptt`.
+    prefix = ".\\" if needs_prefix else ""
+    hints = []
+    if any(problem.lower().startswith("microphone") for problem in report.failures):
+        hints.append((f"{prefix}ptt mic",
+                      "choose a microphone -- the default is the developer's device"))
+    else:
+        hints.append((f"{prefix}ptt devices", "list microphones and resolve the chosen one"))
+    hints += [
+        (f"{prefix}ptt doctor", "re-run these checks"),
+        (f"{prefix}ptt start", "run it in the background"),
         (f"{cfg.HOTKEY_REC} (hold)", "dictate"),
-    ):
-        print(f"    {command:<16}{what}")
+    ]
+
+    print("\n  Next:")
+    for command, what in hints:
+        print(f"    {command:<18}{what}")
+    if needs_prefix:
+        print(f"\n  The `.\\` is not decoration: this shell still has the PATH it started"
+              f"\n  with. In a terminal opened from now on, plain `ptt <command>` works.")
     print()
     return 1 if report.failures else 0
