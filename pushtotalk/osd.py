@@ -23,6 +23,8 @@ _WM_SHOW = W.WM_APP + 1
 _WM_HIDE = W.WM_APP + 2
 _TIMER_ID = 1
 _PADDING = 10  # px at 96 dpi
+_BAR_HEIGHT = 4  # px at 96 dpi
+_BAR_GAP = 6  # px at 96 dpi, between the text and the bar
 _CLASS_NAME = "PushToTalkOSD"
 
 
@@ -32,10 +34,13 @@ class StatusWindow:
         self._text = ""
         self._timeout = 0
         self._error = False
+        self._progress: float | None = None
         self._fonts: dict[int, int] = {}
         self._proc = W.WNDPROC(self._wndproc)
         self._hwnd = self._create_window()
         self._bg_brush = W.CreateSolidBrush(W.rgb(cfg.OSD_BG))
+        self._track_brush = W.CreateSolidBrush(W.rgb(cfg.OSD_PROGRESS_BG))
+        self._fill_brush = W.CreateSolidBrush(W.rgb(cfg.OSD_PROGRESS_FG))
 
     # ------------------------------------------------------------------ window
     def _create_window(self) -> int:
@@ -69,12 +74,18 @@ class StatusWindow:
         return hfont
 
     # ------------------------------------------------------------------ public
-    def show(self, text: str, timeout_ms: int = 1500, *, error: bool = False) -> None:
-        """Display `text`. timeout_ms=0 keeps it up until the next show()/hide()."""
+    def show(self, text: str, timeout_ms: int = 1500, *, error: bool = False,
+              progress: float | None = None) -> None:
+        """Display `text`. timeout_ms=0 keeps it up until the next show()/hide().
+
+        `progress`, 0..1, draws a filled bar under the text instead of just the number
+        in it -- pass None (the default) for a plain status line with no bar.
+        """
         with self._lock:
             self._text = text
             self._timeout = timeout_ms
             self._error = error
+            self._progress = progress
         W.PostMessageW(self._hwnd, _WM_SHOW, 0, 0)
 
     def hide(self) -> None:
@@ -86,7 +97,7 @@ class StatusWindow:
             self._hwnd = 0
 
     # ------------------------------------------------------------------ layout
-    def _measure(self, text: str, dpi: int) -> tuple[int, int]:
+    def _measure(self, text: str, dpi: int, has_progress: bool) -> tuple[int, int]:
         pad = _PADDING * dpi // 96
         max_w = cfg.OSD_MAX_WIDTH * dpi // 96
         hdc = W.GetDC(self._hwnd)
@@ -96,7 +107,10 @@ class StatusWindow:
                     W.DT_CALCRECT | W.DT_WORDBREAK | W.DT_NOPREFIX)
         W.SelectObject(hdc, old)
         W.ReleaseDC(self._hwnd, hdc)
-        return rect.right + 2 * pad, rect.bottom + 2 * pad
+        height = rect.bottom
+        if has_progress:
+            height += (_BAR_GAP + _BAR_HEIGHT) * dpi // 96
+        return rect.right + 2 * pad, height + 2 * pad
 
     def _place(self, width: int, height: int) -> tuple[int, int]:
         point = W.POINT()
@@ -133,6 +147,8 @@ class StatusWindow:
                     W.DeleteObject(hfont)
                 self._fonts.clear()
                 W.DeleteObject(self._bg_brush)
+                W.DeleteObject(self._track_brush)
+                W.DeleteObject(self._fill_brush)
                 return 0
         except Exception:
             log.exception("OSD wndproc failed (msg=0x%04X)", msg)
@@ -140,12 +156,12 @@ class StatusWindow:
 
     def _on_show(self, hwnd: int) -> None:
         with self._lock:
-            text, timeout = self._text, self._timeout
+            text, timeout, progress = self._text, self._timeout, self._progress
         if not text:
             W.ShowWindow(hwnd, W.SW_HIDE)
             return
         dpi = W.dpi_for_window(hwnd)
-        width, height = self._measure(text, dpi)
+        width, height = self._measure(text, dpi, progress is not None)
         x, y = self._place(width, height)
         W.SetWindowPos(hwnd, W.HWND_TOPMOST, x, y, width, height, W.SWP_NOACTIVATE)
         W.ShowWindow(hwnd, W.SW_SHOWNOACTIVATE)
@@ -156,7 +172,7 @@ class StatusWindow:
 
     def _on_paint(self, hwnd: int) -> None:
         with self._lock:
-            text, error = self._text, self._error
+            text, error, progress = self._text, self._error, self._progress
         ps = W.PAINTSTRUCT()
         hdc = W.BeginPaint(hwnd, ctypes.byref(ps))
         try:
@@ -165,12 +181,23 @@ class StatusWindow:
             W.FillRect(hdc, ctypes.byref(rect), self._bg_brush)
             dpi = W.dpi_for_window(hwnd)
             pad = _PADDING * dpi // 96
+            bar_h = _BAR_HEIGHT * dpi // 96
+            text_bottom = rect.bottom - pad
+            if progress is not None:
+                text_bottom -= bar_h + _BAR_GAP * dpi // 96
             old = W.SelectObject(hdc, self._font(dpi))
             W.SetBkMode(hdc, W.TRANSPARENT)
             W.SetTextColor(hdc, W.rgb(cfg.OSD_FG_ERROR if error else cfg.OSD_FG))
-            inner = W.RECT(pad, pad, rect.right - pad, rect.bottom - pad)
+            inner = W.RECT(pad, pad, rect.right - pad, text_bottom)
             W.DrawTextW(hdc, text, -1, ctypes.byref(inner),
                         W.DT_LEFT | W.DT_WORDBREAK | W.DT_NOPREFIX)
             W.SelectObject(hdc, old)
+            if progress is not None:
+                bar = W.RECT(pad, rect.bottom - pad - bar_h, rect.right - pad, rect.bottom - pad)
+                W.FillRect(hdc, ctypes.byref(bar), self._track_brush)
+                fill_width = int((bar.right - bar.left) * max(0.0, min(progress, 1.0)))
+                if fill_width > 0:
+                    fill = W.RECT(bar.left, bar.top, bar.left + fill_width, bar.bottom)
+                    W.FillRect(hdc, ctypes.byref(fill), self._fill_brush)
         finally:
             W.EndPaint(hwnd, ctypes.byref(ps))

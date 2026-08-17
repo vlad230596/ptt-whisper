@@ -9,7 +9,7 @@ REM
 REM Requires an NVIDIA GPU. Do not put this directory in a path with spaces or inside
 REM OneDrive; both are refused rather than silently half-working.
 
-powershell -ExecutionPolicy Bypass -File "%~dp0deploy\Setup.ps1" -- --add-to-path --autostart --start
+powershell -ExecutionPolicy Bypass -File "%~dp0deploy\Setup.ps1" -- --add-to-path
 
 echo.
 echo   Note: `ptt` works in terminals opened from now on. In one that was already open,

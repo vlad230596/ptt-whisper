@@ -151,14 +151,19 @@ def check_inference(report: Report) -> None:
     except Exception as exc:  # noqa: BLE001 -- whatever it is, it is the answer
         report.fail(f"the model would not load ({type(exc).__name__}: {exc})")
         return
-    report.ok(f"loaded {cfg.COMPUTE_TYPE} on {cfg.DEVICE} in {took:.1f} s")
+    report.ok(f"loaded {engine.compute_type} (from {engine.compute_type_source}) "
+              f"on {cfg.DEVICE} in {took:.1f} s")
+    report.ok(f"batching={engine.batching} (from {engine.batching_source})")
     started = time.monotonic()
     try:
         engine.warm_up()
     except Exception as exc:  # noqa: BLE001
         report.fail(f"decoding failed ({type(exc).__name__}: {exc}); "
-                    f"CUBLAS_STATUS_NOT_SUPPORTED here means the compute type is wrong "
-                    f"for this GPU -- COMPUTE_TYPE must stay float16 on RTX 50xx")
+                    f"CUBLAS_STATUS_NOT_SUPPORTED here usually means compute_type="
+                    f"{engine.compute_type!r} has no kernel on this GPU -- float16 is "
+                    f"the default that works everywhere tried so far (see CLAUDE.md, "
+                    f"'float16 is mandatory, int8 is broken'); `ptt doctor` reports "
+                    f"where the current value came from above")
         return
     report.ok(f"decoded 0.3 s of silence in {time.monotonic() - started:.1f} s "
               f"-- the whole CUDA path works")

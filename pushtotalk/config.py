@@ -59,7 +59,15 @@ KEEP_AUDIO = True
 DATA_DIR = str(_ROOT / "dataset")
 
 # ------------------------------- RECOGNITION --------------------------------
-COMPUTE_TYPE = "float16"  # MUST stay float16 on RTX 50xx (int8 -> CUBLAS_STATUS_NOT_SUPPORTED)
+# Default for this machine's config -- but "float16 always" is a fact about the
+# reference GPU (RTX 5080, Blackwell/sm_120), not about every GPU: cuBLAS 12.x has no
+# IMMA kernel for sm_120, so int8 there hard-fails with CUBLAS_STATUS_NOT_SUPPORTED.
+# A machine with real int8 support (Turing/sm_75 and later architectures with DP4A) can
+# override this per machine in settings.json's "compute_type" key -- see settings.py and
+# CLAUDE.md ("float16 is mandatory, int8 is broken") for the mechanism and the field
+# measurement that justified turning it on for one such machine. Do not change this
+# default for the reference hardware.
+COMPUTE_TYPE = "float16"
 LANGUAGE = "ru"
 DEVICE = "cuda"  # explicit, so a CPU fallback fails loudly instead of silently
 
@@ -109,9 +117,21 @@ HALLUCINATIONS = (
 )
 
 # Batched inference splits the audio across VAD chunks and decodes them in parallel.
-# Re-measured in-process on a 35.4 s utterance: 2.06 s sequential -> 1.54 s batched,
-# with slightly better sentence punctuation. On short clips there is only one VAD chunk
-# and nothing to parallelise, hence the length threshold.
+# The single-clip measurement that motivated this (35.4 s, RTX 5080, float16: 2.06 s
+# sequential -> 1.54 s batched, "slightly better sentence punctuation") did not hold up
+# against real usage -- see BACKLOG item 9. Decoding every dataset recording over
+# BATCH_ABOVE_SEC twice (44 clips, this machine, GTX 1650 Ti / int8_float16) measured an
+# average speedup of only 1.06x, and batching lost more than half its punctuation density
+# (against the same audio decoded sequentially) on 8 of the 44 -- including the utterance
+# that surfaced the unpunctuated-run-on bug in CLAUDE.md's "Known limitations". Disabled
+# by default until the same comparison is run on the RTX 5080, where the original 25%
+# number came from and where the trade might look different.
+#
+# Per-machine override, same mechanism as `compute_type` below: settings.json's
+# "batching" key wins over this default -- see settings.py and
+# `settings.effective_batching()`. `ptt doctor` and `ptt devices` report which is in
+# force and where it came from.
+BATCHING_ENABLED = False
 BATCH_ABOVE_SEC = 15
 BATCH_SIZE = 8
 
@@ -188,3 +208,10 @@ OSD_ALPHA = 235  # 0..255
 OSD_BG = (0x20, 0x20, 0x20)  # R, G, B
 OSD_FG = (0xF0, 0xF0, 0xF0)
 OSD_FG_ERROR = (0xFF, 0x8A, 0x80)
+OSD_PROGRESS_BG = (0x40, 0x40, 0x40)  # the bar's empty track
+OSD_PROGRESS_FG = (0x4F, 0xC3, 0xF7)  # the filled portion
+
+# How often the "Transcribing ..." line refreshes while decoding runs. Not measured --
+# just fast enough that the line is visibly still alive on a GPU slow enough for decoding
+# to take seconds, so a long dictation does not look indistinguishable from a hang.
+TRANSCRIBE_TICK_MS = 300

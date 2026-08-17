@@ -56,14 +56,15 @@ D:\Git\ptt-whisper\
 ├─ logs\              pushtotalk.log (rotating), devices.txt
 ├─ assets\            generated .ico files
 ├─ ptt.cmd            CLI wrapper; StartPushToTalk.cmd (background), Dev.cmd (console)
-├─ settings.json      written by the app: the chosen microphone (absent until one is)
+├─ settings.json      written by the app: mic, compute_type (absent until one is set)
 └─ pyproject.toml     + uv.lock, .python-version
 ```
 
 A git repository since 2026-08-13, when the project moved out of `C:\Software\Whisper` —
 the working copy *is* the checkout, model and all. `.gitignore` keeps out what must not
 travel: the venv (rebuilt by `uv sync`), the 3 GB model (fetched by `ptt setup`), the
-logs, `settings.json` (this machine's microphone) and `dataset/` — the owner's voice
+logs, `settings.json` (this machine's microphone and, where set, its compute type) and
+`dataset/` — the owner's voice
 recordings, which stay on the machine that produced them and are the material for tuning
 `HOTWORDS` and `HALLUCINATIONS`. So a fresh clone is code only, and `ptt setup` fills in
 the rest.
@@ -76,9 +77,35 @@ exactly one exception, `settings.json`, described below.
 ## Decisions, with the evidence behind them
 
 ### float16 is mandatory, int8 is broken
-CTranslate2 with cuBLAS 12.x has no sm_120 IMMA kernels; int8 fails with
-`CUBLAS_STATUS_NOT_SUPPORTED`. float16 works (generic GEMM + PTX JIT). `DEVICE = "cuda"`
-is explicit so a CPU fallback fails loudly instead of quietly making dictation slow.
+int8 on the RTX 5080 fails with `CUBLAS_STATUS_NOT_SUPPORTED`; float16 works (generic GEMM
++ PTX JIT). `DEVICE = "cuda"` is explicit so a CPU fallback fails loudly instead of quietly
+making dictation slow.
+
+This is a known upstream issue, not something diagnosed from scratch here:
+[OpenNMT/CTranslate2#1865](https://github.com/OpenNMT/CTranslate2/issues/1865) (matched by
+a second report on the same card, [Purfview/whisper-standalone-win#403](https://github.com/Purfview/whisper-standalone-win/issues/403)).
+The root cause per the fix, [PR #1937](https://github.com/OpenNMT/CTranslate2/pull/1937),
+is narrower than "no int8 kernels for sm_120": cuBLAS's int8 kernels fail when a matrix
+dimension is not a multiple of 4, and Whisper's vocabulary (51865 or 51866 tokens) is not
+one. The fix — disable int8 outright on sm_120 rather than pad around it — landed in
+CTranslate2 **v4.6.2** (2025-12-05), which is older than the **4.8.1** this project pins.
+So the pinned library already refuses int8 on the RTX 5080 by itself; `COMPUTE_TYPE =
+"float16"` here is belt-and-suspenders, not the only thing standing between this project
+and the crash. Worth re-verifying on the RTX 5080 itself — see BACKLOG item 8.
+
+This is specifically the RTX 5080 (Blackwell, sm_120) finding, not a statement about int8
+on every GPU — it is the cuBLAS-12.x-on-sm_120 kernel gap that is broken, not int8 as
+such. Verified in the field on a second machine (GTX 1650 Ti, Turing, sm_75, 4 GB VRAM),
+which has real DP4A int8 support and does not hit `CUBLAS_STATUS_NOT_SUPPORTED` at all:
+`int8_float16` there decoded the real dictation samples in `dataset/` (short, medium and
+long clips) to **byte-identical transcripts** against `float16`, **4.2×–4.8× faster**, at
+roughly half the VRAM (3827 MiB → 1939 MiB). That is a per-machine result, not a reason to
+change the project default — the RTX 5080 stays on `float16`. What it changes is that
+`COMPUTE_TYPE` in config.py is now the *default*, overridable per machine through the
+`compute_type` key in `settings.json` (`settings.effective_compute_type()`, the same
+mechanism and the same rules as `mic` below), for a machine that has actually measured a
+win the way this one did. `ptt doctor` reports which one is in force and where it came
+from.
 
 ### The model stays in VRAM — this is what the rewrite bought
 The subprocess engine mapped ~1.5 GB of DLLs and the 3 GB model on *every* utterance:
@@ -194,6 +221,21 @@ add a second override mechanism (registry, env vars); extend this one.
 The running instance re-reads it on every key-down, which is what lets `ptt mic` in a
 console repoint a background instance without a restart.
 
+A second key, `compute_type`, was added the same way (2026-08-16) for exactly the same
+reason the file exists at all: `COMPUTE_TYPE` is a property of the GPU in the machine, not
+of the project, and this machine's GTX 1650 Ti is not the RTX 5080 the config.py default
+is tuned for (see "float16 is mandatory, int8 is broken" above for the measurement).
+`settings.effective_compute_type()` is `effective_mic()` with the key name changed —
+same tuple-of-value-and-source return, same "not a non-empty string is not set" handling,
+same degrade-and-log-a-warning on a corrupt file, same merge-on-save so it and `mic` never
+clobber each other in the one file. `Engine.load()` calls it instead of reading
+`cfg.COMPUTE_TYPE` directly, and logs the value and its source next to the existing
+model-loaded line; `ptt doctor` and `ptt devices` print it next to the microphone the same
+way. There is no `ptt compute-type` command, because there is no equivalent for `mic`
+either at the console — `ptt mic` only opens the graphical chooser, so a second
+console-only setter for `compute_type` would be an inconsistent surface; the key is
+written to `settings.json` directly for the one machine that has measured a reason to.
+
 ### The chooser is Dear PyGui, on its own thread, and everything about that was measured
 A level meter is an animation; hand-painting one in GDI the way `osd.py` does would be
 hundreds of lines for a bar that moves. Before writing any of it, on this machine with
@@ -276,22 +318,40 @@ on live speech.
 
 ## Known limitations
 
-- **Unpunctuated, all-lower-case output on an occasional utterance.** Reported by the owner
-  on 2026-08-13, from ordinary use: now and then a whole dictation arrives as one run-on
-  line — no sentence breaks, no punctuation, every word lower-cased including `HOTWORDS`
-  terms that are normally cased correctly. Repeating the same sentence gives correct output.
-  **Not reproduced under test, so nothing below is measured — do not write it up as if it
-  were.** What is known: `text.py` cannot cause it (it drops whole segments, and never
-  touches case or punctuation), and the archived mp3 is clean, which rules out capture.
-  That leaves decoding. The likely mechanism is a decode in which the initial prompt stops
-  steering the written style — a temperature fallback after a failed decode is the usual
-  trigger in Whisper, and `initial_prompt` is exactly what teaches casing here (see the
-  decision above). **The experiment is cheap and has not been run**: take the `.mp3` of an
-  affected utterance from `dataset/`, decode it repeatedly, and see whether the bad output
-  is reproducible from that audio (a decoding-path bug) or appears only sometimes (a
-  sampling one). Only then is it worth touching `temperature`, `condition_on_previous_text`
-  or the prompt. Because the pair is archived automatically, the evidence for the next
-  occurrence already exists — ask for the stamp rather than asking the owner to reproduce.
+- **Unpunctuated, all-lower-case output on an occasional utterance — mechanism confirmed
+  2026-08-17.** Reported by the owner on 2026-08-13, from ordinary use: now and then a
+  whole dictation arrives as one run-on line — no sentence breaks, no punctuation, every
+  word lower-cased including `HOTWORDS` terms that are normally cased correctly. Repeating
+  the same sentence gives correct output. The cheap experiment this entry used to call for
+  (decode the archived `.mp3` repeatedly) has now been run, on `ptt_20260817_181701_22.mp3`
+  — 38.4 s, one of the affected utterances. Five repeat decodes through the same code path
+  the app uses (`Engine.transcribe`, batched because the clip is over `BATCH_ABOVE_SEC`)
+  came back **byte-identical** every time: this is a deterministic decoding-path bug, not
+  a sampling one, so `temperature` is not the lever.
+  The same audio decoded through `WhisperModel.transcribe` directly (sequential, bypassing
+  `BatchedInferencePipeline`) came back correctly punctuated and cased, split into six
+  sentence-sized segments at the actual pauses. The difference is VAD chunking: batched
+  inference's default `VadOptions.min_silence_duration_ms` is 2000 ms, and this utterance
+  has no pause that long for nearly 30 continuous seconds, so VAD folds the entire stretch
+  into one chunk. `BatchedInferencePipeline` decodes that chunk in one pass with no
+  internal resegmentation into sentences — which is exactly where the punctuation and
+  casing come from in the sequential path (its own timestamp tokens plus
+  `condition_on_previous_text` across shorter segments). Batching does not resegment what
+  it decodes; it only parallelises VAD-sized chunks. So the bug needs two conditions at
+  once: an utterance long enough to batch (over `BATCH_ABOVE_SEC`) *and* fluent enough to
+  contain no 2-second pause for most of its length — which is also why it is occasional
+  rather than constant.
+  Poking at `min_silence_duration_ms` inside the batched path (tried 2000/500/200 against
+  the same clip) did not give a clean dial: passing the *same* value the default already
+  uses (2000) produced a third, different, also-broken segmentation (a "Thank you for
+  watching" hallucination folded into the first segment) — the batched VAD/merge behaviour
+  is more sensitive to how it's invoked than to the threshold itself, so it is not a safe
+  parameter to tune per-utterance. See `BATCH_ABOVE_SEC` / `BATCH_SIZE` in config.py for
+  where any fix would land, and BACKLOG item 9 for the sequential-vs-batched speed
+  comparison run against this machine's own dataset — batching's measured win there was much
+  thinner than the punctuation cost, which is why the item exists.
+  Because the pair is archived automatically, the evidence for the next occurrence already
+  exists — ask for the stamp rather than asking the owner to reproduce.
 - **`F8` is swallowed globally**, so VS Code's "Go to Next Problem" and debugger F8 stop
   working while it runs. Change `HOTKEY_REC` if that matters.
 - **Elevated windows** need the elevated logon task; an ordinary process cannot hook them.

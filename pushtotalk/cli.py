@@ -112,6 +112,14 @@ def _devices(_args: argparse.Namespace) -> int:
     print(f"\nmicrophone = {mic!r} (from {source})")
     if source == settings.SETTINGS_SOURCE:
         print(f"  config.py default is {cfg.MIC!r}; `ptt mic` changes the choice")
+    compute_type, ct_source = settings.effective_compute_type()
+    print(f"compute_type = {compute_type!r} (from {ct_source})")
+    if ct_source == settings.SETTINGS_SOURCE:
+        print(f"  config.py default is {cfg.COMPUTE_TYPE!r}")
+    batching, batching_source = settings.effective_batching()
+    print(f"batching = {batching!r} (from {batching_source})")
+    if batching_source == settings.SETTINGS_SOURCE:
+        print(f"  config.py default is {cfg.BATCHING_ENABLED!r}")
     try:
         resolved = recorder.Recorder(mic, cfg.SAMPLE_RATE,
                                      cfg.HOST_API_ORDER).resolve_device()

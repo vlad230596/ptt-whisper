@@ -5,14 +5,20 @@ config.py is still the file you edit by hand, and it still holds the default for
 tunable. What it cannot be is the destination of a *runtime* choice: picking a
 microphone from a list and then having to open Python to make the choice stick is not a
 setting flow, and a program that rewrites its own source is worse than a program with
-two settings files. So `settings.json` holds the handful of values the app changes about
-itself -- currently just the microphone -- and overrides the matching name in config.py.
+two settings files. So `settings.json` holds the handful of values that are properties of
+*this machine* rather than of the project -- the microphone, the recognition
+`compute_type` (2026-08-16, for a machine whose GPU does not share the RTX 5080's int8
+limitation), and `batching` (2026-08-17, for a machine that measures a real speed win
+from it -- see BACKLOG item 9 for why it defaults off) -- and overrides the matching
+name in config.py.
 
 Two rules make the split debuggable rather than confusing:
 
-* `effective_mic()` returns the value *and* where it came from, and app.py logs that at
-  startup while `ptt devices` prints it. "Why is it recording from the wrong device"
-  is then one line in the log instead of a guess between two files.
+* `effective_mic()`, `effective_compute_type()` and `effective_batching()` each return
+  the value *and* where it came from, and app.py logs that at startup while
+  `ptt devices` and `ptt doctor` print it. "Why is it recording from the wrong device" or
+  "why is it running int8 on the RTX 5080" is then one line in the log instead of a guess
+  between two files.
 * nothing here raises. A settings.json that is missing, empty, truncated by a power cut
   or hand-edited into invalid JSON degrades to the config.py default and says so in the
   log. Dictation must not become unstartable because of a file that only exists to hold
@@ -125,6 +131,88 @@ def clear_mic(override: str | Path | None = None) -> bool:
     if "mic" not in values:
         return True
     del values["mic"]
+    file = path(override)
+    try:
+        file.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError as exc:
+        log.error("could not write %s (%s)", file, exc)
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ compute type
+def effective_compute_type(override: str | Path | None = None) -> tuple[str, str]:
+    """(compute type, which file it came from).
+
+    Same shape and the same reasons as `effective_mic()`: `COMPUTE_TYPE = "float16"` in
+    config.py is a hardware fact on the reference RTX 5080 (see CLAUDE.md), not a
+    universal one -- a machine whose GPU has real int8 support can override it here
+    instead of hand-editing config.py, and a blank or non-string value is treated as
+    "not set" rather than passed to WhisperModel, which would fail late inside
+    CTranslate2 instead of here.
+    """
+    chosen = load(override).get("compute_type")
+    if isinstance(chosen, str) and chosen.strip():
+        return chosen.strip(), SETTINGS_SOURCE
+    if chosen is not None:
+        log.warning("ignoring compute_type=%r in %s: not a non-empty string",
+                    chosen, path(override))
+    return cfg.COMPUTE_TYPE, CONFIG_SOURCE
+
+
+def set_compute_type(value: str, override: str | Path | None = None) -> bool:
+    value = value.strip()
+    if not value:
+        raise ValueError("the compute type must not be empty")
+    return save({"compute_type": value}, override)
+
+
+def clear_compute_type(override: str | Path | None = None) -> bool:
+    """Go back to whatever config.py says."""
+    values = load(override)
+    if "compute_type" not in values:
+        return True
+    del values["compute_type"]
+    file = path(override)
+    try:
+        file.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError as exc:
+        log.error("could not write %s (%s)", file, exc)
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ batching
+def effective_batching(override: str | Path | None = None) -> tuple[bool, str]:
+    """(batching enabled, which file it came from).
+
+    Same shape and the same reasons as `effective_compute_type()`: `BATCHING_ENABLED =
+    False` in config.py is the default measured on one machine (see BACKLOG item 9), not
+    a universal answer -- a machine that measures a real speed win from batching can
+    override it here instead of hand-editing config.py. Anything other than an actual
+    bool (a string "true", a number) is treated as "not set" rather than coerced, since a
+    coerced typo would silently flip decoding behaviour.
+    """
+    chosen = load(override).get("batching")
+    if isinstance(chosen, bool):
+        return chosen, SETTINGS_SOURCE
+    if chosen is not None:
+        log.warning("ignoring batching=%r in %s: not a bool", chosen, path(override))
+    return cfg.BATCHING_ENABLED, CONFIG_SOURCE
+
+
+def set_batching(value: bool, override: str | Path | None = None) -> bool:
+    return save({"batching": bool(value)}, override)
+
+
+def clear_batching(override: str | Path | None = None) -> bool:
+    """Go back to whatever config.py says."""
+    values = load(override)
+    if "batching" not in values:
+        return True
+    del values["batching"]
     file = path(override)
     try:
         file.write_text(json.dumps(values, ensure_ascii=False, indent=2) + "\n",

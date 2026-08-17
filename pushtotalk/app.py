@@ -41,6 +41,80 @@ _ACTION_MIC_UI = "mic_ui"
 _ACTION_QUIT = "quit"
 
 
+class _ProgressTicker:
+    """Drives the "Transcribing ..." OSD bar while `Engine.transcribe` runs.
+
+    A real completion fraction needs a real-time factor (wall-clock seconds of decode
+    per second of *speech*) to turn "N seconds elapsed" into "N% of this dictation" --
+    faster-whisper does not know in advance how long a decode will take, so `rtf` is
+    supplied by the caller, self-calibrated from this machine's own previous
+    dictations this session (see `App._asr_rtf`). It is deliberately calibrated
+    against speech seconds, not raw recording length: decode cost tracks how much was
+    actually said, not how long the key was held, so a pause-heavy recording and a
+    solid block of speech of the same wall-clock length cost very different amounts of
+    decode time. `on_start` narrows the estimate's denominator from the recording's
+    raw length down to `duration_after_vad` -- what VAD says is actually speech --
+    within the first tick or two, before which the raw length is used as a rough
+    placeholder. Estimated progress is capped short of 100% so it never claims to
+    finish before the decode actually does; a real per-segment fraction from
+    `Engine.transcribe`'s `on_progress` overrides the estimate once available, since
+    it is ground truth rather than a guess. Before either exists -- no calibration
+    sample yet, and no segment decoded yet -- there is nothing to show a bar for, so
+    the line is a plain elapsed-time counter instead.
+    """
+
+    # Short of 100% for the reason above, not because of anything measured -- 99% is
+    # just a recognisable "almost done, but not confirmed" number, the same one most
+    # installers and download bars settle on.
+    _ESTIMATE_CAP = 0.99
+
+    def __init__(self, osd: StatusWindow | None, duration: float, rtf: float | None) -> None:
+        self._osd = osd
+        self._speech_seconds = duration
+        self._rtf = rtf
+        self._started = time.monotonic()
+        self._segment_fraction: float | None = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def on_start(self, _duration: float, duration_after_vad: float) -> None:
+        with self._lock:
+            self._speech_seconds = duration_after_vad
+
+    def on_progress(self, fraction: float) -> None:
+        with self._lock:
+            self._segment_fraction = fraction
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    @property
+    def speech_seconds(self) -> float:
+        with self._lock:
+            return self._speech_seconds
+
+    def _run(self) -> None:
+        while not self._stop.wait(cfg.TRANSCRIBE_TICK_MS / 1000):
+            if self._osd is None:
+                continue
+            elapsed = time.monotonic() - self._started
+            with self._lock:
+                segment_fraction = self._segment_fraction
+                speech_seconds = self._speech_seconds
+            estimate = None
+            if self._rtf and self._rtf > 0 and speech_seconds > 0:
+                estimate = min(elapsed / (speech_seconds * self._rtf), self._ESTIMATE_CAP)
+            candidates = [f for f in (segment_fraction, estimate) if f is not None]
+            if candidates:
+                fraction = max(candidates)
+                self._osd.show(f"Transcribing ... {fraction * 100:.0f}%", 0, progress=fraction)
+            else:
+                self._osd.show(f"Transcribing ... {elapsed:.1f}s", 0)
+
+
 def setup_logging() -> None:
     log_dir = Path(cfg.LOG_DIR)
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +164,13 @@ class App:
         self._target_hwnd = 0
         self._rec_seq = 0
         self._test_mode = False  # show the text instead of pasting it
+        # Wall-clock seconds of decode per second of *speech* (post-VAD, not raw
+        # recording length -- a pause costs nothing to decode), updated after each
+        # dictation this session -- what lets the OSD show a real progress bar instead
+        # of a bare clock. Not persisted: it is a property of this run (thermal state,
+        # what else is on the GPU right now), not a setting, and it re-calibrates
+        # within the first couple of dictations of the next run anyway.
+        self._asr_rtf: float | None = None
 
     # ------------------------------------------------------------------ status
     def _status(self, message: str, timeout_ms: int = 1500, *, error: bool = False) -> None:
@@ -278,9 +359,23 @@ class App:
 
         self._status("Transcribing ...", 0)
         self._tray_state("transcribing")
+        duration = len(audio) / cfg.SAMPLE_RATE
         started = time.monotonic()
-        segments = self._engine.transcribe(audio)
+        ticker = _ProgressTicker(self._osd, duration, self._asr_rtf)
+        try:
+            segments = self._engine.transcribe(
+                audio, on_start=ticker.on_start, on_progress=ticker.on_progress
+            )
+        finally:
+            ticker.stop()
         asr_ms = (time.monotonic() - started) * 1000
+        speech_seconds = ticker.speech_seconds
+        if speech_seconds > 0:
+            sample_rtf = (asr_ms / 1000) / speech_seconds
+            self._asr_rtf = (
+                sample_rtf if self._asr_rtf is None
+                else 0.5 * self._asr_rtf + 0.5 * sample_rtf
+            )
 
         clean = text.clean(segments)
         raw = text.join_segments(segments, drop_hallucinations=False)

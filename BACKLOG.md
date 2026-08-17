@@ -317,3 +317,154 @@ targets exactly one GPU generation at a time.
 **So the sequencing is:** keep the source zip as the supported path; do the bundle only if
 someone other than the owner actually needs it, and start by measuring a pruned `cudnn`,
 because if that does not get comfortably under the cap the rest is wasted effort.
+
+---
+
+## 8. Re-check int8 on the RTX 5080 now that CTranslate2 auto-disables it
+
+**Why this is worth revisiting:** the "float16 is mandatory" rule in CLAUDE.md was written
+around `CUBLAS_STATUS_NOT_SUPPORTED` crashing outright. The upstream fix
+([OpenNMT/CTranslate2#1865](https://github.com/OpenNMT/CTranslate2/issues/1865),
+[PR #1937](https://github.com/OpenNMT/CTranslate2/pull/1937)) landed in CTranslate2
+**v4.6.2** — older than the **4.8.1** this project already pins — and makes CTranslate2
+itself detect sm_120 and refuse int8 before it ever reaches the broken cuBLAS call. That
+was confirmed on a second machine (GTX 1650 Ti, Turing) where int8 is not broken at all and
+is a measured 4.2×-4.8× win (see the CLAUDE.md decision) — it has **not** been re-tried on
+the RTX 5080 since the pinned version changed.
+
+**What to check:**
+
+- Set `compute_type` (via `settings.json`, the same override the Turing machine uses — see
+  `settings.effective_compute_type()`) to `"int8"` or `"int8_float16"` on the RTX 5080 and
+  see what actually happens now: a clean automatic fallback to float16 (in which case
+  `int8` becomes a safe default everywhere and the machine-specific override could
+  disappear), the same old crash (in which case the pinned 4.8.1 does not actually carry the
+  fix the way the changelog suggests, which would itself be worth a note), or a fallback
+  that is silent in a way that hides which compute type is really running (in which case
+  `ptt doctor`/`ptt devices` need to report the *effective* type CTranslate2 chose, not just
+  the one requested).
+- If the fallback is clean, it's still worth comparing decode time against `float16`
+  explicitly on the 5080 — CLAUDE.md's own numbers (17x real-time) were measured before this
+  question existed, so there's no baseline yet for "int8-that-fell-back-to-float16" vs.
+  "float16 requested directly": they should be identical, but that is an assumption, not
+  something measured.
+- Do this deliberately (not as a background surprise): flipping `COMPUTE_TYPE`'s *effective*
+  default away from a hard-set `"float16"` on the reference machine is exactly the kind of
+  change CLAUDE.md's hard-constraints section says is "not up for silent revision."
+
+---
+
+## 9. Batching's speed win doesn't hold up against real usage — now gated by `BATCHING_ENABLED`
+
+**Why this is here:** CLAUDE.md's "Adaptive batching above 15 s" decision rests on one test
+clip (35.4 s, RTX 5080, float16): 2.06 s sequential → 1.54 s batched, a clear 25% win, plus
+"slightly better sentence punctuation." Investigating the unpunctuated-run-on bug (see
+CLAUDE.md's "Known limitations") found the opposite of that second claim — batching can lose
+punctuation, not improve it — which made the first claim worth re-checking against more than
+one clip.
+
+**What was measured (2026-08-17, this machine: GTX 1650 Ti, `int8_float16`):** every dataset
+recording over `BATCH_ABOVE_SEC` (44 of them, 1450.6 s of audio total) decoded twice — once
+through `WhisperModel.transcribe` (sequential), once through `BatchedInferencePipeline`
+(batched, `BATCH_SIZE=8`), both with production options (`hotwords`, `initial_prompt`,
+`vad_filter=True`).
+
+| | Sequential | Batched |
+| --- | --- | --- |
+| Total decode time | 1024.06 s | 964.40 s |
+| Realtime factor | 1.4x | 1.5x |
+| **Overall speedup** | — | **1.06x** |
+
+A 6% average win, not 25% — and it isn't a uniform 6%: per-file speedup ranged from 0.85x
+(batched *slower*) to 2.00x, with no obvious predictor from duration alone. The 35.4 s
+reference clip's 25% number was one sample from that same spread, not the typical case.
+
+**Punctuation cost, measured the same way:** comparing punctuation-marks-per-letter between
+the two transcripts of each file, **8 of 44 utterances (18%)** had batched-mode punctuation
+density less than half of sequential's — the same failure this item exists because of, not
+limited to the one utterance that surfaced it (`ptt_20260817_181701_22.mp3`, in CLAUDE.md).
+Text differed between modes on 43 of 44 files overall (most differences minor — a comma
+here, a case there — the 8-file figure above is the one that isolates the severe cases).
+
+**Reading it:** on this machine, batching buys ~6% average speed for an 18% chance that a
+long dictation comes back with its punctuation and casing broken. That trade doesn't look
+worth it here. What's *not* measured is whether the RTX 5080 (the reference machine
+CLAUDE.md's original numbers came from, on `float16` rather than `int8_float16`) shows a
+larger speed gain that would change the calculus — the punctuation cost is a property of VAD
+chunking and shouldn't depend on the GPU, but the speedup side of the trade might. Re-run
+this same comparison there before changing the *default* project-wide; the script used is
+`decode_audio()` + `Engine._model.transcribe()` vs `Engine._batched.transcribe()` over
+`dataset/*.mp3`, filtered to `duration > BATCH_ABOVE_SEC` — cheap enough to hand-run against
+any machine's own `dataset/` before deciding.
+
+**Acted on, 2026-08-17:** rather than deleting the batched path outright, `BATCHING_ENABLED`
+in config.py now gates it, defaulting to `False`, with a per-machine override in
+`settings.json`'s `"batching"` key — same mechanism and the same tests as `compute_type`
+(`settings.effective_batching()`, `ptt doctor` / `ptt devices` report which is in force and
+where it came from). This is deliberately the same shape as the RTX-5080-vs-Turing split for
+`compute_type` above: if the RTX 5080 measurement shows batching is worth it *there*,
+`settings.json` on that machine is where that goes, without touching the shared default that
+the rest of this item's evidence argues against.
+
+**Full per-file data**, sequential vs. batched, every `dataset/*.mp3` over `BATCH_ABOVE_SEC`
+(15 s) on this machine at the time of measurement:
+
+| file | dur (s) | seq (s) | batch (s) | speedup | seq punct % | batch punct % | text identical |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| ptt_20260816_190728_2 | 20.9 | 16.11 | 15.16 | 1.06 | 4.3 | 3.2 | ✗ |
+| ptt_20260816_191051_4 | 75.5 | 64.29 | 53.35 | 1.21 | 3.5 | 3.2 | ✗ |
+| ptt_20260816_191418_6 | 40.1 | 27.80 | 26.03 | 1.07 | 0.0 | 0.9 | ✗ |
+| ptt_20260816_191510_7 | 17.9 | 14.65 | 13.87 | 1.06 | 4.7 | 2.3 | ✗ |
+| ptt_20260816_192115_9 | 46.6 | 40.66 | 38.19 | 1.06 | 1.8 | 2.2 | ✗ |
+| ptt_20260816_212349_2 | 16.4 | 11.16 | 12.38 | 0.90 | 5.1 | 3.7 | ✗ |
+| ptt_20260816_214426_3 | 21.5 | 14.70 | 13.01 | 1.13 | 4.8 | 3.3 | ✗ |
+| ptt_20260816_214809_5 | 32.9 | 22.63 | 19.92 | 1.14 | 0.0 | 0.8 | ✗ |
+| ptt_20260816_214938_6 | 31.0 | 29.11 | 14.56 | 2.00 | 4.9 | 0.0 | ✗ |
+| ptt_20260816_215359_7 | 53.9 | 40.90 | 40.03 | 1.02 | 4.0 | 4.0 | ✗ |
+| ptt_20260816_215432_8 | 15.2 | 8.79 | 8.66 | 1.01 | 3.4 | 0.0 | ✗ |
+| ptt_20260816_220839_9 | 33.9 | 22.47 | 21.67 | 1.04 | 4.8 | 0.5 | ✗ |
+| ptt_20260816_221103_10 | 31.9 | 25.85 | 26.19 | 0.99 | 5.3 | 6.0 | ✗ |
+| ptt_20260816_222404_11 | 19.7 | 12.86 | 13.63 | 0.94 | 3.9 | 3.8 | ✗ |
+| ptt_20260816_224209_14 | 61.3 | 48.20 | 46.99 | 1.03 | 6.8 | 6.1 | ✗ |
+| ptt_20260816_224305_15 | 28.5 | 14.25 | 13.76 | 1.04 | 3.0 | 2.6 | ✗ |
+| ptt_20260816_224445_16 | 49.0 | 38.40 | 37.73 | 1.02 | 3.3 | 3.5 | ✗ |
+| ptt_20260816_224518_17 | 23.1 | 12.93 | 12.19 | 1.06 | 5.3 | 5.3 | ✗ |
+| ptt_20260816_225329_19 | 28.9 | 13.40 | 13.30 | 1.01 | 4.4 | 5.5 | ✗ |
+| ptt_20260816_225703_21 | 48.2 | 30.44 | 31.84 | 0.96 | 5.4 | 6.2 | ✗ |
+| ptt_20260816_230704_2 | 16.2 | 8.51 | 9.21 | 0.92 | 6.3 | 0.0 | ✗ |
+| ptt_20260816_230920_3 | 47.8 | 24.37 | 28.71 | 0.85 | 0.0 | 4.1 | ✗ |
+| ptt_20260816_231641_1 | 48.1 | 35.10 | 27.78 | 1.26 | 5.4 | 6.0 | ✗ |
+| ptt_20260816_231826_2 | 18.7 | 9.74 | 10.39 | 0.94 | 2.9 | 2.8 | ✗ |
+| ptt_20260816_231932_3 | 21.0 | 13.37 | 14.37 | 0.93 | 3.7 | 3.7 | ✗ |
+| ptt_20260816_234226_1 | 40.5 | 29.68 | 28.27 | 1.05 | 5.4 | 3.5 | ✗ |
+| ptt_20260816_235409_2 | 36.0 | 20.98 | 20.81 | 1.01 | 3.1 | 2.8 | ✗ |
+| ptt_20260817_140957_1 | 37.8 | 27.14 | 25.06 | 1.08 | 6.1 | 6.1 | ✓ |
+| ptt_20260817_141200_2 | 21.8 | 12.08 | 12.34 | 0.98 | 2.9 | 2.9 | ✗ |
+| ptt_20260817_141601_3 | 34.8 | 29.23 | 26.96 | 1.08 | 5.5 | 1.2 | ✗ |
+| ptt_20260817_142114_4 | 15.6 | 11.53 | 11.43 | 1.01 | 5.3 | 5.3 | ✗ |
+| ptt_20260817_142609_6 | 33.4 | 24.53 | 26.16 | 0.94 | 3.1 | 3.1 | ✗ |
+| ptt_20260817_144338_7 | 23.9 | 13.20 | 13.27 | 0.99 | 2.8 | 2.8 | ✗ |
+| ptt_20260817_151144_8 | 21.6 | 11.83 | 12.37 | 0.96 | 5.2 | 4.6 | ✗ |
+| ptt_20260817_151244_9 | 31.0 | 24.46 | 18.86 | 1.30 | 3.7 | 3.4 | ✗ |
+| ptt_20260817_153358_10 | 47.8 | 34.87 | 37.72 | 0.92 | 4.2 | 4.0 | ✗ |
+| ptt_20260817_163227_12 | 24.4 | 16.11 | 15.69 | 1.03 | 5.7 | 5.7 | ✗ |
+| ptt_20260817_164222_15 | 33.9 | 25.72 | 24.39 | 1.05 | 3.1 | 3.1 | ✗ |
+| ptt_20260817_170459_17 | 45.6 | 27.01 | 21.36 | 1.26 | 2.0 | 1.8 | ✗ |
+| ptt_20260817_172047_19 | 33.2 | 26.26 | 27.51 | 0.95 | 4.7 | 4.4 | ✗ |
+| ptt_20260817_173301_20 | 33.8 | 24.15 | 21.71 | 1.11 | 4.1 | 4.0 | ✗ |
+| ptt_20260817_181701_22 | 38.4 | 29.23 | 26.65 | 1.10 | 4.7 | 1.4 | ✗ |
+| ptt_20260817_181843_23 | 30.8 | 24.88 | 19.93 | 1.25 | 4.1 | 4.4 | ✗ |
+| ptt_20260817_183315_24 | 18.3 | 10.50 | 10.97 | 0.96 | 1.6 | 0.0 | ✗ |
+
+`ptt_20260817_181701_22` is the utterance in CLAUDE.md's "Known limitations" entry.
+"punct %" is punctuation marks per 100 letters in that file's transcript — a rough proxy,
+not a quality score; the 8 rows where the batched column is under half the sequential one
+are the severe cases (`_191510_7`, `_214938_6`, `_215432_8`, `_220839_9`, `_230704_2`,
+`_141601_3`, `_181701_22`, `_183315_24`).
+
+**If the RTX 5080 confirms the same picture:** the simplest fix is to stop batching entirely
+(drop the `BatchedInferencePipeline` branch in `asr.py`, or set `BATCH_ABOVE_SEC` past any
+real dictation length) rather than try to tune `VadOptions.min_silence_duration_ms` inside the
+batched path — that was tried against the reference utterance and turned out fragile (the
+same threshold value produced a different, still-broken segmentation depending on how it was
+passed), so it isn't a safe dial.
