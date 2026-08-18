@@ -352,6 +352,19 @@ on live speech.
   thinner than the punctuation cost, which is why the item exists.
   Because the pair is archived automatically, the evidence for the next occurrence already
   exists — ask for the stamp rather than asking the owner to reproduce.
+- **A second, distinct tail-degeneration bug: ALL-CAPS instead of lower-case, on the
+  *sequential* path** — see BACKLOG item 13. Same broad shape (very long, pause-free
+  speech losing casing/punctuation control near the end) but confirmed *not* the batching
+  bug above: `BATCHING_ENABLED` was already off on this machine when it happened, and 6
+  repeat decodes of the archived clip through the exact production code path came back
+  byte-identical and correctly cased — the bug did not reproduce from the archived (lossy
+  mp3) audio at all. Best-supported hypothesis is Whisper's own documented
+  temperature-fallback context collapse (a bad segment poisons everything after it via
+  `condition_on_previous_text`, with no later reset), not anything specific to this
+  project's chunking — see item 13 for the evidence, the two upstream reports, and the
+  diagnostics `asr.py` now logs (`pipeline=`, per-utterance `avg_logprob`/`no_speech_prob`/
+  `temperature_fallbacks`, and a `WARNING` with the full per-segment breakdown if the
+  shape recurs) so the next occurrence doesn't need another repro session.
 - **`F8` is swallowed globally**, so VS Code's "Go to Next Problem" and debugger F8 stop
   working while it runs. Change `HOTKEY_REC` if that matters.
 - **Elevated windows** need the elevated logon task; an ordinary process cannot hook them.

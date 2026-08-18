@@ -468,3 +468,288 @@ real dictation length) rather than try to tune `VadOptions.min_silence_duration_
 batched path — that was tried against the reference utterance and turned out fragile (the
 same threshold value produced a different, still-broken segmentation depending on how it was
 passed), so it isn't a safe dial.
+
+---
+
+## 10. Queue overlapping dictations instead of dropping the key press
+
+**Where it stands today:** [`app.py`](pushtotalk/app.py)'s `_enqueue()` drops a `PTT_DOWN`
+outright while `_busy` is set — i.e. for the whole tail of one utterance: VAD grace period,
+transcription, archiving, paste. The OSD says "Still finishing the previous dictation ..."
+and that recording never happened; whatever was said during it is gone. This was a deliberate
+choice (see the docstring on `_enqueue`) to avoid a worse bug — queuing the key press so it
+silently starts recording *after* the previous one finishes, seconds after the words were
+actually spoken — but the fix it chose was "refuse the second press," not "make the second
+press free."
+
+**What it should do instead:** a spoken thought that runs long enough to want two breaths
+should be splittable into two (or more) key presses, each captured immediately, each queued
+for transcription, and each pasted in order once its turn comes — without the second press
+ever being rejected or having to wait for the first press's decode to finish. Concretely:
+
+- Pressing the hotkey starts a *new* recording immediately, regardless of whether an earlier
+  recording is still being transcribed. The only thing that should block a new recording is
+  another recording literally in progress (mic already open) — never "the GPU is busy."
+- Each finished recording (audio + its own captured `_target_hwnd`, the same per-utterance
+  target capture that already exists) is pushed onto a FIFO queue rather than transcribed
+  inline.
+- A single consumer drains the queue one item at a time — decode, then paste — so utterances
+  land in the order they were *spoken*, not the order their decode happened to finish in
+  (irrelevant today since there is one GPU and one model instance to serialize on anyway, but
+  worth stating as the invariant the design must preserve).
+- Nothing about "record now, decode later" changes single-GPU serialization of the actual
+  inference — only the *recording* stops being gated on the *previous decode*.
+
+**What has to change to get there — this is the hard part, not the queue itself:**
+
+- The single `_busy` boolean has to split into two independent states: "is the mic capturing
+  right now" (still exclusive — one Recorder, one stream) and "is there a backlog of
+  unfinished transcriptions" (no longer exclusive with recording). `_start_recording` should
+  only check the first.
+- `self._target_hwnd` is a single field today because there was only ever one utterance in
+  flight; with a queue, the paste target has to travel with each queued item instead of living
+  on `self`, or utterance 2's paste target overwrites utterance 1's before utterance 1 gets to
+  use it.
+- **Media pause/resume needs reference counting, not edge-triggering.** Today pause fires once
+  per `_start_recording`, resume once per `_finish`. With two overlapping utterances, a naive
+  port would resume the paused music between utterance 1 finishing and utterance 2 still being
+  transcribed — audible flicker. Pause on the first recording to start while the queue is
+  otherwise empty; resume only when both the queue is drained and no recording is active.
+- **The OSD/tray need a queued-depth state**, not just "recording / transcribing": what shows
+  while recording #2 is captured but #1 is still decoding, and what shows while #1's paste
+  happens and #2 is still recording. "Transcribing ... (1 queued)" is the minimum; item 5's
+  panel is the natural long-term home for a real queue view.
+- **Errors must not wedge the queue.** `_worker`'s existing catch-and-log-and-continue around
+  each action is the right shape to extend to the transcribe/paste step — one bad item should
+  not stop the rest of the queue from draining.
+- **Archive ordering** (`_next_seq`, the stamp used for `dataset/*.mp3`) already increments
+  per utterance regardless of when transcription happens, so this should fall out for free —
+  worth double-checking once the queue exists rather than assuming.
+- No cap on queue depth is needed: it is bounded by how many times a human can press a key
+  before the GPU catches up, which in practice is very small.
+
+---
+
+## 11. Warn early that nothing is actually being captured, instead of only after decoding
+
+**The incident this is from:** dictating for 30 s-1 min into what turned out to be a dead
+input — a mic muted or disconnected as a side effect of troubleshooting something else
+(unplugged, wrong device left selected, physically muted) — with no way to know until the
+whole recording had been spoken, captured, and sent to the model, only to get back "no
+audio captured." The waste is entirely avoidable: whether the input is live is knowable
+within a second or two, not only at the end.
+
+**What exists already and is directly reusable:**
+
+- `recorder.rms()` and the `MIN_RMS = 0.0002` threshold in
+  [config.py](pushtotalk/config.py) already draw exactly this line — a silent room on the
+  reference machine measures `0.00086` (a real, if quiet, room), so `MIN_RMS` is tuned to
+  catch a truly dead device, not just a quiet speaker. Today it is only checked once, in
+  `App._finish()`, *after* the whole recording is over.
+- `recorder.LevelMonitor` already does incremental, low-cost level tracking for the
+  microphone chooser's meter: it accumulates `sum_squares`/`count`/`peak` in the capture
+  callback and hands back a windowed RMS on `read()`, resetting for the next window. That
+  is the right shape for a periodic check *during* a live `Recorder` capture too — cheap
+  per callback, no re-concatenating a growing minute-long buffer on every tick the way a
+  naive "call `rms()` on everything captured so far" would be.
+- The live-elapsed-counter idea in item 2 already establishes where a repeating tick during
+  recording should live (an OSD-owned `SetTimer`, not a `threading.Timer` in `app.py`) —
+  this wants the same kind of tick, so the two are worth building together if either one
+  gets picked up first.
+
+**What it should do:** while recording is in progress, sample the running level every
+second or so; if it stays under `MIN_RMS` continuously for some short window (5 s is what
+was asked for — long enough that a normal breath or a thoughtful pause before speaking
+doesn't false-positive, short enough that it's still much cheaper than losing the whole
+utterance), surface it in the OSD next to the `REC` status — something like
+`REC ... — no sound detected, check the mic` — without stopping or discarding the
+recording. The person holding the key decides what to do with that information; the
+program must never auto-cancel a recording on this signal alone, because "quiet speech
+that is nonetheless real audio" and "dead mic" are only reliably told apart at the
+`MIN_RMS` boundary that already exists, and a false auto-cancel would lose a real dictation
+outright, which is a worse failure than a spurious warning.
+
+**Design notes:**
+
+- This is a level check, not VAD/speech detection — "are there any fluctuations at all"
+  is right, matching what the user asked for; it should not try to guess whether *speech*
+  is present, only whether the input is alive. `vad_filter`/hallucination filtering already
+  own the harder "was there meaningful speech" question post-decode, and this item
+  shouldn't duplicate that.
+- Reset the continuous-silence timer whenever the level crosses back above `MIN_RMS`, so a
+  brief dead patch followed by real speech doesn't leave a stale warning on screen — the
+  same warning should also need to clear itself once sound resumes.
+- The end-of-recording check in `_finish()` (`level < cfg.MIN_RMS` → "No audio captured")
+  stays as the authoritative final word regardless — this item is purely about surfacing
+  the same fact earlier, not replacing that check.
+- Worth deciding whether the 5 s threshold is a new `config.py` constant
+  (`SILENCE_WARNING_MS`, alongside the comment-with-measurement convention every other
+  constant in that file already follows) or reuses `MIN_REC_MS`/`TAIL_MS`'s neighborhood —
+  it is a genuinely different knob from either, so a new one is more likely right.
+
+---
+
+## 12. A live level meter in the `REC` OSD instead of the plain `REC ...` text
+
+**What:** while recording, show the microphone's actual level moving in real time — a
+filling bar, à la the meter Windows' own volume mixer draws, rather than a static
+`REC ...` string. Two birds: it is a nicer thing to glance at than plain text, and it
+*is* item 11's silence warning without needing a sentence — a bar that visibly isn't
+moving tells you the mic is dead faster and more plainly than any words would.
+
+**The pieces for this already exist, on both sides:**
+
+- [`osd.py`](pushtotalk/osd.py)'s `StatusWindow.show()` already takes a `progress: float`
+  and paints a filled bar under the text (`_track_brush`/`_fill_brush`, drawn in
+  `_on_paint`) — built for the transcribe-percentage bar, but the widget itself has no
+  idea what the fraction *means*. `REC` and `Transcribing` never overlap, so the same bar
+  can serve double duty: a live level while recording, a decode fraction while
+  transcribing — no new paint code needed for a first, rectangular version.
+- [`micui.py`](pushtotalk/micui.py)'s microphone-chooser meter has already solved the
+  "level to bar" mapping this wants to copy, not reinvent: `recorder.dbfs()` for a
+  floor-clamped dB value, `(level_db - floor) / -floor` to normalize it to 0..1, and
+  `cfg.METER_CLIP_DB` to flag when the input is clipping. Match that curve instead of
+  inventing a second one — a linear RMS-to-bar mapping (no dB) would make ordinary speech
+  barely move the needle, which is the opposite of legible.
+- The cheap incremental level read this needs from a live `Recorder` capture is the exact
+  same thing item 11 needs — `recorder.LevelMonitor`'s windowed
+  `sum_squares`/`count`/`peak` accumulated in the capture callback, read and reset on a
+  timer, rather than re-running `rms()` over the whole growing buffer every tick. Build
+  that plumbing once and both items use it.
+- The tick that drives the repaint is the same mechanism item 2 already proposes for a
+  live elapsed-seconds counter: an OSD-owned `SetTimer`, ~100 ms, not a `threading.Timer`
+  in `app.py`. If item 2 lands first, this is "feed the same timer a level instead of a
+  clock"; if this lands first, item 2 is the reverse.
+
+**Design notes:**
+
+- A real icon-shaped fill (the actual little-microphone-glyph-filling-from-the-bottom look
+  Windows uses) is meaningfully more paint work than the rectangle bar already in
+  `osd.py` — GDI has no cheap vector fill-clip primitive, so that would mean either a
+  bitmap mask or stacking small shapes to fake the icon outline. Worth doing only as a
+  second pass, once the plain rectangle bar is confirmed to feel good — item 2's own
+  `_ESTIMATE_CAP`/monospace-digit notes are a reminder of how many small legibility details
+  a bar like this accumulates once you actually look at it moving.
+- Item 11's continuous-silence timer is not wasted once the bar exists — it is still the
+  right way to decide when to change the bar's *color* (e.g. the same red clip-highlight
+  micui uses, repurposed as a "nothing for 5 s" cue) rather than only relying on the user
+  to notice a flat bar on their own. The text warning in item 11 becomes a fallback for
+  that same signal, not the primary one.
+- Before any level sample has arrived (the first ~100 ms of a recording), there is nothing
+  to draw a fraction for — same situation `_ProgressTicker` already handles for
+  transcription, and the same fix applies: show plain `REC ...` text for that first tick,
+  then switch to the bar once real data exists, rather than drawing a fake empty bar.
+- Keep the label minimal while the bar is up (`REC`, not a full sentence) — the whole
+  point is to stop fighting the bar for space in a small tooltip window.
+
+---
+
+## 13. A second, distinct run-on-tail degeneration — ALL-CAPS on the *sequential* path, not reproducible from the archived clip
+
+**Why this is here:** the owner reported `ptt_20260817_230856_13` (`dataset/`, 162.5 s,
+23:07 on 2026-08-17) coming back correctly transcribed up through "...и так мы
+двигаемся. Но..." and then flipping to a run-on, almost unpunctuated, **ALL-CAPS** tail
+for the rest of the utterance (log: `1451 chars | rec 162.5s | asr 75.0s`). This looks
+like the run-on-lowercase bug already in CLAUDE.md's "Known limitations", but that entry's
+root cause is specific to `BatchedInferencePipeline` skipping resegmentation on a single
+huge VAD chunk — and this utterance did **not** go through the batched path.
+
+**Confirmed from code + settings, not assumed:** `settings.json` on this machine has no
+`"batching"` key, so `settings.effective_batching()` resolves to `config.py`'s
+`BATCHING_ENABLED = False` (set earlier the same day by item 9). `Engine.transcribe()`
+only takes the `BatchedInferencePipeline` branch when `self.batching and duration >
+BATCH_ABOVE_SEC`; with `self.batching` false, this utterance — despite being 10x over
+`BATCH_ABOVE_SEC` — went through plain `WhisperModel.transcribe` (sequential). So the
+already-documented batching root cause does not apply here; this is a different failure
+reachable from the path that was supposed to be the safe one.
+
+**What was measured (2026-08-17, this machine, GTX 1650 Ti):** the archived
+`dataset/ptt_20260817_230856_13.mp3` decoded through `WhisperModel.transcribe` with the
+exact production options (`hotwords`, `initial_prompt` from `HOTWORDS`, `vad_filter=True`,
+`compute_type=int8_float16` from `settings.json`, everything else at faster-whisper's
+defaults, i.e. `condition_on_previous_text=True` and the built-in `(0.0, 0.2, 0.4, 0.6,
+0.8, 1.0)` temperature-fallback schedule):
+
+- **6 repeats, byte-identical every time, no degeneration.** 17 segments, 1625 chars,
+  46–52 s each (one outlier at 81 s, same text — a scheduling hiccup, not a different
+  decode). Every segment's `temperature` was `0.0` (the fallback schedule never had to
+  fall back) and the upper-case letter fraction never exceeded 0.07 outside single
+  interjections ("Вот.", "Но...") that are legitimately capitalised. `VAD filter removed
+  0.3 s` of the 162.7 s clip — essentially the same "no real pause anywhere" shape as
+  production's own log line (`VAD filter removed 00:00.272`).
+- The bug **did not reproduce**, on the exact code path, the exact options, and (per
+  `settings.json`) the exact compute type production used.
+
+**What that non-reproduction means:** VAD applies before either branch and found almost
+no silence in both the buggy run and every local repeat — consistent, not the
+differentiator. The sequential path's own ~30 s internal windowing (timestamp tokens,
+`condition_on_previous_text`) is exactly the mechanism CLAUDE.md credits with fixing the
+batched bug, and it ran here too, so "no resegmentation at all" is not what happened
+either. What's left is that the archived clip differs from what production actually fed
+the model: `dataset/*.mp3` is encoded by `archive.py` from the same float32 buffer the
+live model saw, but **mp3 is lossy** — decoding it back is not byte-identical to the
+original PCM. The determinism measured above (6/6 identical) rules out GPU-kernel
+nondeterminism as the reason it doesn't reproduce; it does not rule out the mp3 round-trip
+having perturbed the samples just enough to avoid whatever knife-edge triggered the
+original decode. There is no way to test that directly — the raw pre-encode PCM was never
+kept (nothing in this project's design keeps it; see "Archiving" in CLAUDE.md).
+
+**Two levers tried anyway, against the (non-buggy) archived clip, as a check on whether
+either is worth reaching for if this recurs:**
+
+| variant | segments | chars | notes |
+| --- | ---: | ---: | --- |
+| production options (baseline) | 17 | 1625 | clean, correct case throughout |
+| `condition_on_previous_text=False` | 21 | 1051 | **35% less content** — the clip fragments into short 1–3 s segments once context stops carrying forward, and the tail degrades into a hallucinated echo of the `HOTWORDS` term list (`"StandaloneTrackingSocket RemoteTracking ImGui nRF52840 cpu"` as if spoken) — the exact echo-the-prompt-back failure `INITIAL_PROMPT` was added to suppress, per CLAUDE.md |
+| no `hotwords`/`initial_prompt` | 18 | 1376 | stays correctly cased, but the tail decodes into `"Спасибо за просмотр!"` — the trailing-silence subtitle hallucination the initial prompt and `HALLUCINATIONS` blocklist exist to stop |
+
+Neither lever is a safe general fix on this evidence: turning off context conditioning
+traded the (unreproduced) caps bug for a documented, worse failure (prompt-echo
+hallucination, and a third of the transcript missing); dropping the prompt reintroduced
+the subtitle-credit hallucination the prompt was added to kill. `float16` compute type was
+not tested against this clip — a second model instance approached this GPU's 4 GB VRAM
+ceiling with the live app already resident and was killed rather than risk destabilising
+the machine's own dictation; this remains unverified here and would need either the RTX
+5080 or a moment where the live app can be stopped first.
+
+**Best-supported hypothesis, not proven:** this is Whisper's own documented long-context
+failure mode — a temperature-fallback on one segment (quality thresholds failed at
+temperature 0, so the decode retried at a higher temperature) can leave the model "stuck"
+producing degenerate text (unpunctuated, or here upper-case) for the remainder of the
+audio once `condition_on_previous_text` feeds that segment's text forward, because there
+is no later point where the context resets. This is reported independently of this
+project: [SYSTRAN/faster-whisper#1130](https://github.com/SYSTRAN/faster-whisper/issues/1130)
+("some English is output as all uppercase" — unresolved, no fix merged) and
+[openai/whisper#194](https://github.com/openai/whisper/discussions/194) (long audio
+"stuck in a no-punctuation mode" partway through, a maintainer attributing it to the
+temperature-fallback prompt-reset rule and the model then "deciding to go without
+punctuation from there" with no recovery). Both are the same shape as this utterance: long
+audio, no clean recovery point, one bad segment poisoning everything after it — plausible,
+not confirmed, because the production run's own per-segment `temperature`/`avg_logprob`
+were never logged and the exact input that triggered it cannot be replayed.
+
+**Relationship to the batched/lowercase bug in CLAUDE.md:** same broad shape (very long,
+pause-free speech losing casing/punctuation control for its tail) but a **different
+mechanism** — that one is "no resegmentation happens at all" (batched VAD chunking, fixed
+by not batching); this one happens on the very path that was supposed to be safe from it,
+and best evidence points at Whisper's own temperature-fallback context-collapse rather
+than anything specific to this project's chunking. Kept as a separate item rather than
+folded into that bullet for that reason — CLAUDE.md's bullet now cross-references this one
+instead of restating it.
+
+**Diagnostics added, 2026-08-17, so the next occurrence doesn't need a repro session:**
+`asr.py`'s `Engine.transcribe()` now logs which pipeline actually ran
+(`pipeline=sequential` / `pipeline=batched`) plus one summary line per real utterance —
+segment count, the worst `avg_logprob`/`no_speech_prob`/`compression_ratio` seen, and how
+many segments needed a temperature fallback. If any segment looks like this bug (an
+all-caps segment, or a long segment with almost no punctuation — both known shapes, see
+`asr.py`'s `_Diagnostics`) it also logs the full per-segment breakdown at `WARNING`, so the
+evidence needed to confirm or rule out the temperature-fallback hypothesis is captured
+automatically instead of depending on the dataset clip still reproducing it later.
+
+**Next step if it recurs:** read the new per-segment log line for that utterance first —
+if `temperature_fallbacks > 0` on or just before the point where the transcript degrades,
+that confirms the hypothesis above and the fix to look at is upstream (there is no
+supported "reset context after a bad segment" option in faster-whisper today per #1130).
+If `temperature_fallbacks` is 0 throughout, the hypothesis is wrong and this needs
+reopening from scratch with real per-segment evidence for the first time.

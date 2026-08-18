@@ -23,6 +23,99 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# A segment whose letters are mostly upper-case is the signature of the ALL-CAPS
+# tail-degeneration bug (see CLAUDE.md's "Known limitations", 2026-08-17 addition):
+# on a long, pause-free utterance the model has been seen to flip into upper-case,
+# near-punctuation-free output for the remainder of the recording. `_DIAG_CAPS_*`
+# is what flags a segment as part of that.
+_DIAG_CAPS_MIN_LETTERS = 6
+_DIAG_CAPS_UPPER_FRACTION = 0.8
+
+# The sibling bug (same section of CLAUDE.md, discovered first) is a whole run-on,
+# all-lower-case, essentially unpunctuated segment -- there the giveaway is not casing
+# but a long segment with almost no punctuation at all. `_DIAG_FLAT_*` flags that
+# shape too, so one mechanism catches both known failure modes instead of only the one
+# that happened to be reported most recently.
+_DIAG_FLAT_MIN_DURATION_SEC = 12.0
+_DIAG_FLAT_MAX_PUNCT_PER_100_CHARS = 1.0
+_PUNCTUATION = ".,!?;:-–—"
+
+
+class _Diagnostics:
+    """Cheap per-segment bookkeeping, collected while draining the same generator
+    `transcribe()` already has to drain to build the transcript -- no extra decoding.
+
+    Added 2026-08-17 after two look-alike bugs (CLAUDE.md's "Known limitations"): an
+    occasional run-on, unpunctuated, all-lower-case tail on the batched path, and a
+    separate occurrence of an all-caps, near-unpunctuated tail on the *sequential*
+    path (`ptt_20260817_230856_13`, 162.5 s, no >=2 s pause anywhere, `BATCHING_ENABLED`
+    off on this machine so batching's already-documented root cause does not apply).
+    Both looked, from the log alone, like an ordinary successful transcription -- the
+    only trace was the archived transcript itself. This exists so the *next*
+    occurrence leaves evidence in `pushtotalk.log` without needing the dataset clip
+    re-decoded from scratch.
+
+    Logged unconditionally, once per real (`vad=True`) utterance: a one-line summary,
+    proportional to the one `"%d chars | rec ...s | asr ...s"` line `app.py` already
+    logs for every dictation. The full per-segment breakdown is only logged when one of
+    the two shapes above is actually detected -- which should be rare -- so this does
+    not turn into per-utterance log spam.
+    """
+
+    __slots__ = ("segments", "caps", "flat")
+
+    def __init__(self) -> None:
+        self.segments: list = []
+        self.caps: list[tuple[int, float, float]] = []
+        self.flat: list[tuple[int, float, float]] = []
+
+    def add(self, segment) -> None:
+        i = len(self.segments)
+        self.segments.append(segment)
+        text = segment.text
+        letters = [c for c in text if c.isalpha()]
+        if (
+            len(letters) >= _DIAG_CAPS_MIN_LETTERS
+            and sum(1 for c in letters if c.isupper()) / len(letters)
+            > _DIAG_CAPS_UPPER_FRACTION
+        ):
+            self.caps.append((i, segment.start, segment.end))
+        duration = segment.end - segment.start
+        if duration >= _DIAG_FLAT_MIN_DURATION_SEC:
+            punct = sum(1 for c in text if c in _PUNCTUATION)
+            punct_per_100 = 100 * punct / max(len(text), 1)
+            if punct_per_100 < _DIAG_FLAT_MAX_PUNCT_PER_100_CHARS:
+                self.flat.append((i, segment.start, segment.end))
+
+    def log(self, pipeline: str) -> None:
+        if not self.segments:
+            return
+        min_avg_logprob = min(s.avg_logprob for s in self.segments)
+        max_no_speech = max(s.no_speech_prob for s in self.segments)
+        max_compression_ratio = max(s.compression_ratio for s in self.segments)
+        fallbacks = sum(1 for s in self.segments if s.temperature > 0)
+        log.info(
+            "pipeline=%s segments=%d min_avg_logprob=%.3f max_no_speech_prob=%.3f "
+            "max_compression_ratio=%.2f temperature_fallbacks=%d",
+            pipeline, len(self.segments), min_avg_logprob, max_no_speech,
+            max_compression_ratio, fallbacks,
+        )
+        if not self.caps and not self.flat:
+            return
+        log.warning(
+            "possible decoding degeneration (see CLAUDE.md 'Known limitations', "
+            "run-on lower/upper-case tail): caps_segments=%s flat_segments=%s",
+            [(i, f"{a:.1f}-{b:.1f}") for i, a, b in self.caps],
+            [(i, f"{a:.1f}-{b:.1f}") for i, a, b in self.flat],
+        )
+        for i, s in enumerate(self.segments):
+            log.warning(
+                "  segment %2d %6.1f-%6.1f avg_logprob=%+.3f no_speech=%.3f "
+                "temperature=%.1f compression_ratio=%.2f: %r",
+                i, s.start, s.end, s.avg_logprob, s.no_speech_prob, s.temperature,
+                s.compression_ratio, s.text,
+            )
+
 
 class Engine:
     def __init__(self) -> None:
@@ -131,7 +224,9 @@ class Engine:
         # and BACKLOG item 9) -- disabled by default, since the measured speed win did
         # not hold up against real usage and batching can lose punctuation on a long,
         # pause-free utterance.
-        if self.batching and duration > cfg.BATCH_ABOVE_SEC:
+        batched = self.batching and duration > cfg.BATCH_ABOVE_SEC
+        pipeline = "batched" if batched else "sequential"
+        if batched:
             segments, info = self._batched.transcribe(
                 audio, batch_size=cfg.BATCH_SIZE, **options
             )
@@ -140,10 +235,16 @@ class Engine:
         if on_start is not None:
             on_start(info.duration, info.duration_after_vad)
         # faster-whisper decodes lazily; the generator must be drained here, inside the
-        # call the caller timed.
+        # call the caller timed. Cheap per-segment diagnostics are collected in the same
+        # pass -- see `_Diagnostics`'s docstring for why and what they are for.
         texts = []
+        diag = _Diagnostics() if vad else None
         for segment in segments:
             texts.append(segment.text)
+            if diag is not None:
+                diag.add(segment)
             if on_progress is not None and info.duration:
                 on_progress(min(segment.end / info.duration, 1.0))
+        if diag is not None:
+            diag.log(pipeline)
         return texts
